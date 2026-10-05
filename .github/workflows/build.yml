@@ -38,46 +38,32 @@ jobs:
           cmake -GNinja -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF .
           ninja -C build -j"$(nproc)" ssl crypto
 
-      - name: Build the front end and the PoCs
-        run: BSSL_DIR="$GITHUB_WORKSPACE/boringssl" bash server/build.sh "$GITHUB_WORKSPACE/bin"
+      - name: Build the server-side programs (server patch only)
+        run: |
+          ONLY_SERVER=1 BSSL_DIR="$GITHUB_WORKSPACE/boringssl" bash server/build.sh "$GITHUB_WORKSPACE/bin"
+          ./bin/poc_suspend | tee poc_suspend.log
 
-      - name: Run the PoCs (in-process, no network needed)
+      - name: Apply the client-side code to the same BoringSSL tree
+        run: |
+          # poc_end_to_end and poc_client exercise both sides (a REALITY client
+          # and a REALITY server in one process), so the client-side seams are
+          # added here too. tools/apply_client_code.py is the generator used to
+          # produce patches/naiveproxy-reality-client.patch.
+          python3 tools/apply_client_code.py "$GITHUB_WORKSPACE/boringssl"
+          ninja -C boringssl/build -j"$(nproc)" ssl
+
+      - name: Build all programs (incl. the REALITY client) and run PoC 2
         run: |
           set -o pipefail
-          ./bin/poc_suspend   | tee poc_suspend.log
+          BSSL_DIR="$GITHUB_WORKSPACE/boringssl" bash server/build.sh "$GITHUB_WORKSPACE/bin"
           ./bin/poc_end_to_end | tee poc_end_to_end.log
-
-      - name: Smoke-test the front end over real TCP (REALITY + fallback)
-        run: |
-          set -o pipefail
-          ./bin/genkey > /tmp/keys.txt
-          PRIV=$(sed -n 1p /tmp/keys.txt)
-          PUB=$(sed -n 2p /tmp/keys.txt)
-          SHORT=0102030405060708
-          ./bin/poc_mirror_server 18443 > mirror.log 2>&1 &
-          sleep 1
-          ./bin/reality_server --listen 127.0.0.1:18444 --target 127.0.0.1:18443 \
-            --private-key "$PRIV" --short-id "$SHORT" > frontend.log 2>&1 &
-          sleep 1
-          echo "--- authenticated REALITY client ---"
-          ./bin/poc_client 18444 "$PUB" "$SHORT" "ci-smoke" | tee client.log
-          grep -q "handshake ok" client.log
-          grep -q "ci-smoke" client.log
-          echo "--- unauthenticated probe (transparent fallback) ---"
-          printf 'probe-through-fallback\n' | timeout 15 openssl s_client \
-            -connect 127.0.0.1:18444 -tls1_3 -quiet -servername probe.test > probe.log 2>&1 || true
-          grep -q "CN = mirror" probe.log
-          grep -q "probe-through-fallback" probe.log
-          echo "--- front end log ---"
-          cat frontend.log
-          grep -q "mirrored ServerHello: yes, 122 bytes" frontend.log
-          echo "OK: REALITY handshake + mirror injection + transparent fallback"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: reality-server-linux-x86_64
           path: |
+            bin/genkey
             bin/reality_server
             bin/poc_suspend
             bin/poc_end_to_end
