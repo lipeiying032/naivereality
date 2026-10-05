@@ -350,7 +350,7 @@ index 954af185b8..a740dcad92 100644
      OPENSSL_PUT_ERROR(SSL, SSL_R_WRONG_SIGNATURE_TYPE);
      *out_alert = SSL_AD_ILLEGAL_PARAMETER;
 diff --git a/src/third_party/boringssl/src/ssl/handshake_client.cc b/src/third_party/boringssl/src/ssl/handshake_client.cc
-index 62d5a0b245..688520f112 100644
+index 62d5a0b245..f40b21847b 100644
 --- a/src/third_party/boringssl/src/ssl/handshake_client.cc
 +++ b/src/third_party/boringssl/src/ssl/handshake_client.cc
 @@ -19,6 +19,7 @@
@@ -380,7 +380,7 @@ index 62d5a0b245..688520f112 100644
 +//               salt = client_random[0:20], info = "REALITY")
 +// from the X25519 key share this client offers. Returns true on success.
 +static bool reality_derive_auth_key(SSL_HANDSHAKE *hs, uint8_t out_key[32]) {
-+  SSL *const ssl = hs->ssl;
++  SSLImpl *const ssl = hs->ssl;
 +  uint8_t private_key[32];
 +  bool found = false;
 +  for (const auto &key_share : hs->key_shares) {
@@ -420,7 +420,7 @@ index 62d5a0b245..688520f112 100644
 +// ClientHello's legacy session id. Called after the ClientHello has been built
 +// and before it is hashed and sent, so the transcript and the wire bytes agree.
 +static bool reality_patch_client_hello(SSL_HANDSHAKE *hs, Array<uint8_t> *msg) {
-+  SSL *const ssl = hs->ssl;
++  SSLImpl *const ssl = hs->ssl;
 +  if (!ssl->reality_configured) {
 +    return true;
 +  }
