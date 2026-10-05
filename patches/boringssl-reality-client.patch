@@ -1,0 +1,285 @@
+diff --git a/src/third_party/boringssl/src/include/openssl/ssl.h b/src/third_party/boringssl/src/include/openssl/ssl.h
+index 7c9929ae6e..a2ca6ed931 100644
+--- a/src/third_party/boringssl/src/include/openssl/ssl.h
++++ b/src/third_party/boringssl/src/include/openssl/ssl.h
+@@ -5423,6 +5423,24 @@ OPENSSL_EXPORT void SSL_CTX_set_dos_protection_cb(
+ // For now, this is incompatible with `SSL_VERIFY_NONE` mode, and is only
+ // respected on clients.
+ OPENSSL_EXPORT void SSL_CTX_set_reverify_on_resume(SSL_CTX *ctx, int enabled);
++// SSL_set1_reality_config configures |ssl| as a REALITY client. |public_key| is
++// the REALITY server's static X25519 public key and |short_id| is the short id
++// sent in the sealed ClientHello session id. It must be called before the
++// handshake; when it is not called, |ssl| is an ordinary BoringSSL client.
++OPENSSL_EXPORT int SSL_set1_reality_config(SSL *ssl,
++                                           const uint8_t public_key[32],
++                                           const uint8_t short_id[8]);
++
++// SSL_reality_verify_certificate checks a REALITY server certificate. It
++// returns one when the leaf certificate's signature field equals
++// HMAC-SHA512(AuthKey, leaf_ed25519_public_key), which proves the peer derived
++// the same authentication key from the ClientHello session id. |leaf_der| is
++// the DER-encoded leaf certificate. It returns zero when REALITY is not
++// configured on |ssl| or the check fails.
++OPENSSL_EXPORT int SSL_reality_verify_certificate(SSL *ssl,
++                                                  const uint8_t *leaf_der,
++                                                  size_t leaf_der_len);
++
+ 
+ // SSL_ST_* are possible values for `SSL_state`, the bitmasks that make them up,
+ // and some historical values for compatibility. Only `SSL_ST_INIT` and
+diff --git a/src/third_party/boringssl/src/ssl/extensions.cc b/src/third_party/boringssl/src/ssl/extensions.cc
+index 954af185b8..a740dcad92 100644
+--- a/src/third_party/boringssl/src/ssl/extensions.cc
++++ b/src/third_party/boringssl/src/ssl/extensions.cc
+@@ -352,7 +352,14 @@ bool tls12_check_peer_sigalg(const SSL_HANDSHAKE *hs, uint8_t *out_alert,
+   // The peer must have selected an algorithm that is consistent with its public
+   // key, the TLS version, and what we advertised.
+   Span<const uint16_t> sigalgs = tls12_get_verify_sigalgs(hs);
+-  if (std::find(sigalgs.begin(), sigalgs.end(), sigalg) == sigalgs.end() ||
++  // REALITY: the server signs CertificateVerify with an Ed25519 certificate
++  // that Chrome-family clients do not advertise. Allow this one signature
++  // scheme only when REALITY is configured on the connection, and leave the
++  // advertised list untouched.
++  const bool is_reality_ed25519 =
++      hs->ssl->reality_configured && sigalg == SSL_SIGN_ED25519;
++  if ((std::find(sigalgs.begin(), sigalgs.end(), sigalg) == sigalgs.end() &&
++       !is_reality_ed25519) ||
+       !ssl_pkey_supports_algorithm(hs->ssl, pkey, sigalg, /*is_verify=*/true)) {
+     OPENSSL_PUT_ERROR(SSL, SSL_R_WRONG_SIGNATURE_TYPE);
+     *out_alert = SSL_AD_ILLEGAL_PARAMETER;
+diff --git a/src/third_party/boringssl/src/ssl/handshake_client.cc b/src/third_party/boringssl/src/ssl/handshake_client.cc
+index 62d5a0b245..688520f112 100644
+--- a/src/third_party/boringssl/src/ssl/handshake_client.cc
++++ b/src/third_party/boringssl/src/ssl/handshake_client.cc
+@@ -19,6 +19,7 @@
+ #include <assert.h>
+ #include <limits.h>
+ #include <string.h>
++#include <time.h>
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -26,6 +27,9 @@
+ #include <openssl/aead.h>
+ #include <openssl/bn.h>
+ #include <openssl/bytestring.h>
++#include <openssl/curve25519.h>
++#include <openssl/digest.h>
++#include <openssl/hkdf.h>
+ #include <openssl/ec_key.h>
+ #include <openssl/ecdsa.h>
+ #include <openssl/err.h>
+@@ -181,6 +185,109 @@ bool ssl_write_client_hello_without_extensions(const SSL_HANDSHAKE *hs,
+   return true;
+ }
+ 
++// REALITY: derives the authentication key
++//   HKDF-SHA256(X25519(client ephemeral private key, server static public key),
++//               salt = client_random[0:20], info = "REALITY")
++// from the X25519 key share this client offers. Returns true on success.
++static bool reality_derive_auth_key(SSL_HANDSHAKE *hs, uint8_t out_key[32]) {
++  SSL *const ssl = hs->ssl;
++  uint8_t private_key[32];
++  bool found = false;
++  for (const auto &key_share : hs->key_shares) {
++    if (key_share->GroupID() != SSL_GROUP_X25519) {
++      continue;
++    }
++    ScopedCBB cbb;
++    uint8_t *data = nullptr;
++    size_t len = 0;
++    if (!CBB_init(cbb.get(), 32) || !key_share->SerializePrivateKey(cbb.get()) ||
++        !CBB_finish(cbb.get(), &data, &len)) {
++      return false;
++    }
++    if (len != sizeof(private_key)) {
++      OPENSSL_free(data);
++      return false;
++    }
++    OPENSSL_memcpy(private_key, data, sizeof(private_key));
++    OPENSSL_free(data);
++    found = true;
++    break;
++  }
++  if (!found || ssl->s3 == nullptr) {
++    return false;
++  }
++  uint8_t shared_key[32];
++  static const uint8_t kInfo[] = "REALITY";
++  if (!X25519(shared_key, private_key, ssl->reality_public_key) ||
++      !HKDF(out_key, 32, EVP_sha256(), shared_key, sizeof(shared_key),
++            ssl->s3->client_random, 20, kInfo, sizeof(kInfo) - 1)) {
++    return false;
++  }
++  return true;
++}
++
++// REALITY: seals the client version, a timestamp and the short id into the
++// ClientHello's legacy session id. Called after the ClientHello has been built
++// and before it is hashed and sent, so the transcript and the wire bytes agree.
++static bool reality_patch_client_hello(SSL_HANDSHAKE *hs, Array<uint8_t> *msg) {
++  SSL *const ssl = hs->ssl;
++  if (!ssl->reality_configured) {
++    return true;
++  }
++  // The legacy session id contents are at offset 39: 4-byte handshake header,
++  // 2-byte legacy_version, 32-byte random, then the one-byte session-id length.
++  static const size_t kSessionIdOffset = 39;
++  static const size_t kSessionIdLength = 32;
++  static const uint8_t kClientVersion[3] = {1, 0, 0};
++  if (msg->size() < kSessionIdOffset + kSessionIdLength ||
++      hs->session_id.size() != kSessionIdLength || ssl->s3 == nullptr) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
++  uint8_t auth_key[32];
++  if (!reality_derive_auth_key(hs, auth_key)) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
++  // The sealed blob is 16 bytes of payload (version, timestamp, short id) plus
++  // the 16-byte AEAD tag, filling the 32-byte session id exactly.
++  uint8_t plaintext[16] = {0};
++  plaintext[0] = kClientVersion[0];
++  plaintext[1] = kClientVersion[1];
++  plaintext[2] = kClientVersion[2];
++  plaintext[3] = 0;  // reserved
++  const uint32_t timestamp = static_cast<uint32_t>(time(nullptr));
++  plaintext[4] = static_cast<uint8_t>(timestamp >> 24);
++  plaintext[5] = static_cast<uint8_t>(timestamp >> 16);
++  plaintext[6] = static_cast<uint8_t>(timestamp >> 8);
++  plaintext[7] = static_cast<uint8_t>(timestamp);
++  OPENSSL_memcpy(plaintext + 8, ssl->reality_short_id, 8);
++
++  // The AEAD additional data is the ClientHello with a zeroed session id,
++  // matching what the server reconstructs.
++  OPENSSL_memset(msg->data() + kSessionIdOffset, 0, kSessionIdLength);
++  EVP_AEAD_CTX aead_ctx;
++  if (!EVP_AEAD_CTX_init(&aead_ctx, EVP_aead_aes_256_gcm(), auth_key,
++                         sizeof(auth_key), 0, nullptr)) {
++    return false;
++  }
++  uint8_t sealed[32];
++  size_t sealed_len = 0;
++  const bool ok = EVP_AEAD_CTX_seal(
++      &aead_ctx, sealed, &sealed_len, sizeof(sealed), ssl->s3->client_random + 20,
++      12, plaintext, sizeof(plaintext), msg->data(), msg->size());
++  EVP_AEAD_CTX_cleanup(&aead_ctx);
++  if (!ok || sealed_len != sizeof(sealed)) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
++  OPENSSL_memcpy(msg->data() + kSessionIdOffset, sealed, sizeof(sealed));
++  OPENSSL_memcpy(hs->session_id.data(), sealed, sizeof(sealed));
++  OPENSSL_memcpy(ssl->reality_auth_key, auth_key, sizeof(auth_key));
++  ssl->reality_auth_key_set = true;
++  return true;
++}
++
+ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+   SSLImpl *const ssl = hs->ssl;
+   ScopedCBB cbb;
+@@ -197,6 +304,12 @@ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+     return false;
+   }
+ 
++  // REALITY: seal the authentication blob into the session id before
++  // the ClientHello is hashed and sent.
++  if (!reality_patch_client_hello(hs, &msg)) {
++    return false;
++  }
++
+   return ssl->method->add_message(ssl, std::move(msg));
+ }
+ 
+diff --git a/src/third_party/boringssl/src/ssl/internal.h b/src/third_party/boringssl/src/ssl/internal.h
+index 60ee51b004..b3a79c00b5 100644
+--- a/src/third_party/boringssl/src/ssl/internal.h
++++ b/src/third_party/boringssl/src/ssl/internal.h
+@@ -4369,6 +4369,16 @@ class SSLImpl : public ssl_st {
+   // server is true iff this SSL* is the server half. Note: before the SSL*
+   // is initialized by either SSL_set_accept_state or SSL_set_connect_state,
+   // the side is not determined. In this state, server is always false.
++  // REALITY client state. |reality_configured| is set by
++  // |SSL_set1_reality_config| before the handshake. |reality_auth_key| is
++  // derived while the ClientHello is built and consulted when the peer
++  // certificate is verified.
++  bool reality_configured = false;
++  uint8_t reality_public_key[32] = {0};
++  uint8_t reality_short_id[8] = {0};
++  bool reality_auth_key_set = false;
++  uint8_t reality_auth_key[32] = {0};
++
+   bool server : 1;
+ 
+   // quiet_shutdown is true if the connection should not send a close_notify on
+diff --git a/src/third_party/boringssl/src/ssl/ssl_lib.cc b/src/third_party/boringssl/src/ssl/ssl_lib.cc
+index b7d99807fd..48fb59558e 100644
+--- a/src/third_party/boringssl/src/ssl/ssl_lib.cc
++++ b/src/third_party/boringssl/src/ssl/ssl_lib.cc
+@@ -29,6 +29,8 @@
+ #include <openssl/crypto.h>
+ #include <openssl/err.h>
+ #include <openssl/evp.h>
++#include <openssl/hmac.h>
++#include <openssl/x509.h>
+ #include <openssl/mem.h>
+ #include <openssl/nid.h>
+ #include <openssl/rand.h>
+@@ -3012,6 +3014,56 @@ void SSL_CTX_set_select_certificate_cb(
+   FromOpaque(ctx)->select_certificate_cb = cb;
+ }
+ 
++
++int SSL_set1_reality_config(SSL *ssl, const uint8_t public_key[32],
++                            const uint8_t short_id[8]) {
++  if (ssl == nullptr || public_key == nullptr || short_id == nullptr) {
++    return 0;
++  }
++  OPENSSL_memcpy(FromOpaque(ssl)->reality_public_key, public_key, 32);
++  OPENSSL_memcpy(FromOpaque(ssl)->reality_short_id, short_id, 8);
++  FromOpaque(ssl)->reality_configured = true;
++  return 1;
++}
++
++int SSL_reality_verify_certificate(SSL *ssl, const uint8_t *leaf_der,
++                                   size_t leaf_der_len) {
++  if (ssl == nullptr || !FromOpaque(ssl)->reality_configured ||
++      !FromOpaque(ssl)->reality_auth_key_set || leaf_der == nullptr) {
++    return 0;
++  }
++  const uint8_t *p = leaf_der;
++  bssl::UniquePtr<X509> leaf(d2i_X509(nullptr, &p, leaf_der_len));
++  if (leaf == nullptr) {
++    return 0;
++  }
++  EVP_PKEY *pubkey = X509_get0_pubkey(leaf.get());
++  if (pubkey == nullptr || EVP_PKEY_id(pubkey) != EVP_PKEY_ED25519) {
++    return 0;
++  }
++  uint8_t raw_public_key[32];
++  size_t raw_public_key_len = sizeof(raw_public_key);
++  if (!EVP_PKEY_get_raw_public_key(pubkey, raw_public_key,
++                                   &raw_public_key_len) ||
++      raw_public_key_len != sizeof(raw_public_key)) {
++    return 0;
++  }
++  const ASN1_BIT_STRING *signature = nullptr;
++  X509_get0_signature(&signature, nullptr, leaf.get());
++  if (signature == nullptr || ASN1_STRING_length(signature) != 64) {
++    return 0;
++  }
++  uint8_t expected[64];
++  unsigned int expected_len = 0;
++  if (HMAC(EVP_sha512(), FromOpaque(ssl)->reality_auth_key, 32, raw_public_key,
++           sizeof(raw_public_key), expected,
++           &expected_len) == nullptr ||
++      expected_len != sizeof(expected)) {
++    return 0;
++  }
++  return CRYPTO_memcmp(expected, ASN1_STRING_get0_data(signature), 64) == 0;
++}
++
+ void SSL_CTX_set_dos_protection_cb(SSL_CTX *ctx,
+                                    int (*cb)(const SSL_CLIENT_HELLO *)) {
+   FromOpaque(ctx)->dos_protection_cb = cb;

@@ -1,0 +1,256 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index c45829c..46394b8 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -5282,6 +5282,28 @@ OPENSSL_EXPORT void SSL_CTX_set_select_certificate_cb(
+     SSL_CTX *ctx,
+     enum ssl_select_cert_result_t (*cb)(const SSL_CLIENT_HELLO *));
+ 
++// reality_serverhello_cb is called on a server just before the ServerHello is
++// sent. If it returns one and sets |*out| and |*out_len| to a complete
++// ServerHello handshake message (including the four-byte handshake header),
++// BoringSSL sends a rewritten copy of that message instead of the ServerHello
++// it generated itself: the legacy_session_id echo and the key_share extension
++// are replaced with this connection's values, and the mirrored random and
++// cipher suite are adopted when the cipher suite is one this server can use
++// with the transcript hash already in progress. If the callback returns zero,
++// or the mirrored message cannot be used, the generated ServerHello is sent
++// unchanged.
++//
++// This is the REALITY mirroring hook. It only substitutes the bytes that go on
++// the wire; the handshake state machine is untouched, and the hook is inert
++// unless it is installed.
++typedef int (*reality_serverhello_cb)(SSL *ssl, const uint8_t **out,
++                                      size_t *out_len);
++
++// SSL_CTX_set_reality_serverhello_cb installs |cb| as the REALITY ServerHello
++// mirroring callback for |ctx|. See |reality_serverhello_cb| for details.
++OPENSSL_EXPORT void SSL_CTX_set_reality_serverhello_cb(
++    SSL_CTX *ctx, reality_serverhello_cb cb);
++
+ // SSL_CTX_set_dos_protection_cb sets a callback that is called once the
+ // resumption decision for a ClientHello has been made. It can return one to
+ // allow the handshake to continue or zero to cause the handshake to abort.
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index 74c901c..3f25e5b 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -5008,7 +5008,12 @@ bool tls1_choose_signature_algorithm(SSL_HANDSHAKE *hs,
+     }
+ 
+     if (std::find(peer_sigalgs.begin(), peer_sigalgs.end(), sigalg) !=
+-        peer_sigalgs.end()) {
++            peer_sigalgs.end() ||
++        // REALITY: the temporary certificate is signed with Ed25519 even
++        // though clients such as Chrome do not advertise it. This carve-out is
++        // narrow (Ed25519 only) and is inert unless the REALITY ServerHello
++        // hook is installed. See |SSL_CTX_set_reality_serverhello_cb|.
++        (sigalg == SSL_SIGN_ED25519 && ssl->ctx->reality_cb != nullptr)) {
+       *out = sigalg;
+       return true;
+     }
+diff --git a/ssl/internal.h b/ssl/internal.h
+index 5880da1..0c9f9f7 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -3857,6 +3857,12 @@ struct ssl_ctx_st : public bssl::RefCounted<ssl_ctx_st> {
+   // and is further constrained by |SSL_OP_NO_*|.
+   uint16_t conf_min_version = 0;
+ 
++  // reality_cb, if not null, is called just before a server sends its
++  // ServerHello. When it supplies a mirrored ServerHello, BoringSSL sends a
++  // rewritten copy of it instead of the message it generated. See
++  // |SSL_CTX_set_reality_serverhello_cb|.
++  reality_serverhello_cb reality_cb = nullptr;
++
+   // num_tickets is the number of tickets to send immediately after the TLS 1.3
+   // handshake. TLS 1.3 recommends single-use tickets so, by default, issue two
+   /// in case the client makes several connections before getting a renewal.
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index be46b95..1fd6ea8 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -2906,6 +2906,11 @@ void SSL_CTX_set_select_certificate_cb(
+   ctx->select_certificate_cb = cb;
+ }
+ 
++void SSL_CTX_set_reality_serverhello_cb(SSL_CTX *ctx,
++                                        reality_serverhello_cb cb) {
++  ctx->reality_cb = cb;
++}
++
+ void SSL_CTX_set_dos_protection_cb(SSL_CTX *ctx,
+                                    int (*cb)(const SSL_CLIENT_HELLO *)) {
+   ctx->dos_protection_cb = cb;
+diff --git a/ssl/tls13_server.cc b/ssl/tls13_server.cc
+index 88ad22b..5235451 100644
+--- a/ssl/tls13_server.cc
++++ b/ssl/tls13_server.cc
+@@ -989,6 +989,147 @@ static enum ssl_hs_wait_t do_read_second_client_hello(SSL_HANDSHAKE *hs) {
+   return ssl_hs_ok;
+ }
+ 
++// REALITY: rebuilds a mirrored ServerHello so that it agrees with this
++// connection's state. |mirror| points at a complete ServerHello handshake
++// message captured from the real target site. On success, |*out| is replaced
++// with a message that carries the mirrored random, cipher suite and extension
++// list, but this connection's legacy_session_id echo and key_share ciphertext.
++//
++// Returns true on success. On failure |*out| is left untouched and the caller
++// sends the ServerHello BoringSSL generated. This function only rewrites the
++// bytes that are sent; the handshake state machine is not touched.
++static bool reality_apply_server_hello(SSL_HANDSHAKE *hs, Array<uint8_t> *out,
++                                       const uint8_t *mirror,
++                                       size_t mirror_len) {
++  SSL *const ssl = hs->ssl;
++
++  CBS sh(Span<const uint8_t>(mirror, mirror_len)), body, mirror_random,
++      mirror_sid, mirror_cipher, mirror_compression, extensions;
++  uint8_t msg_type;
++  uint32_t body_len;
++  uint16_t legacy_version;
++  if (!CBS_get_u8(&sh, &msg_type) || msg_type != SSL3_MT_SERVER_HELLO ||
++      !CBS_get_u24(&sh, &body_len) ||
++      !CBS_get_bytes(&sh, &body, body_len) ||  //
++      CBS_len(&sh) != 0 ||
++      !CBS_get_u16(&body, &legacy_version) ||  //
++      !CBS_get_bytes(&body, &mirror_random, 32) ||
++      !CBS_get_u8_length_prefixed(&body, &mirror_sid) ||
++      !CBS_get_u16_length_prefixed(&body, &mirror_cipher) ||
++      !CBS_get_u8_length_prefixed(&body, &mirror_compression) ||
++      !CBS_get_u16_length_prefixed(&body, &extensions) ||  //
++      CBS_len(&body) != 0) {
++    return false;
++  }
++  if (CBS_len(&mirror_sid) > SSL_MAX_SSL_SESSION_ID_LENGTH ||
++      CBS_len(&mirror_cipher) != 2 || CBS_len(&mirror_compression) != 1) {
++    return false;
++  }
++
++  // Adopt the mirrored cipher suite only if this server knows it, it is a
++  // TLS 1.3 suite, and it uses the same hash as the transcript we have already
++  // initialized. Otherwise the mirrored bytes are rewritten below to name the
++  // cipher suite we negotiated, so that both sides hash the same handshake.
++  uint16_t cipher_value;
++  CBS cipher_cbs = mirror_cipher;
++  if (!CBS_get_u16(&cipher_cbs, &cipher_value)) {
++    return false;
++  }
++  const SSL_CIPHER *adopted = SSL_get_cipher_by_value(cipher_value);
++  const bool can_adopt =
++      adopted != nullptr &&
++      SSL_CIPHER_get_min_version(adopted) >= TLS1_3_VERSION &&
++      ssl_get_handshake_digest(ssl_protocol_version(ssl), adopted) ==
++          hs->transcript.Digest();
++
++  ScopedCBB cbb;
++  CBB out_body, out_sid, out_extensions;
++  if (!CBB_init(cbb.get(), mirror_len + 32) ||
++      !CBB_add_u8(cbb.get(), SSL3_MT_SERVER_HELLO) ||
++      !CBB_add_u24_length_prefixed(cbb.get(), &out_body) ||
++      !CBB_add_u16(&out_body, legacy_version) ||
++      !CBB_add_bytes(&out_body, CBS_data(&mirror_random), 32) ||
++      !CBB_add_u8_length_prefixed(&out_body, &out_sid) ||
++      !CBB_add_bytes(&out_sid, hs->session_id.data(), hs->session_id.size()) ||
++      !CBB_add_u16(&out_body,
++                   can_adopt ? cipher_value
++                             : SSL_CIPHER_get_protocol_id(hs->new_cipher)) ||
++      !CBB_add_bytes(&out_body, CBS_data(&mirror_compression), 1) ||
++      !CBB_add_u16_length_prefixed(&out_body, &out_extensions)) {
++    return false;
++  }
++
++  bool found_key_share = false;
++  bool found_supported_versions = false;
++  while (CBS_len(&extensions) > 0) {
++    uint16_t ext_type;
++    CBS ext_body;
++    if (!CBS_get_u16(&extensions, &ext_type) ||
++        !CBS_get_u16_length_prefixed(&extensions, &ext_body)) {
++      return false;
++    }
++    // We never negotiated a PSK, so a mirrored PSK selection cannot be used.
++    if (ext_type == TLSEXT_TYPE_pre_shared_key) {
++      return false;
++    }
++    if (ext_type == TLSEXT_TYPE_key_share) {
++      CBS key_share = ext_body;
++      uint16_t group_id;
++      CBS peer_key;
++      if (!CBS_get_u16(&key_share, &group_id) ||
++          !CBS_get_u16_length_prefixed(&key_share, &peer_key) ||
++          CBS_len(&key_share) != 0) {
++        return false;
++      }
++      // The mirrored key share must be in the group we negotiated, and the
++      // server's own key share must have the same length, or it cannot be
++      // substituted. See RFC 8446, section 4.1.3.
++      if (group_id != hs->new_session->group_id ||
++          CBS_len(&peer_key) != hs->key_share_ciphertext.size()) {
++        return false;
++      }
++      CBB key_share_out, key_out;
++      if (!CBB_add_u16(&out_extensions, TLSEXT_TYPE_key_share) ||
++          !CBB_add_u16_length_prefixed(&out_extensions, &key_share_out) ||
++          !CBB_add_u16(&key_share_out, group_id) ||
++          !CBB_add_u16_length_prefixed(&key_share_out, &key_out) ||
++          !CBB_add_bytes(&key_out, hs->key_share_ciphertext.data(),
++                         hs->key_share_ciphertext.size())) {
++        return false;
++      }
++      found_key_share = true;
++      continue;
++    }
++    if (ext_type == TLSEXT_TYPE_supported_versions) {
++      found_supported_versions = true;
++    }
++    CBB ext_out;
++    if (!CBB_add_u16(&out_extensions, ext_type) ||
++        !CBB_add_u16_length_prefixed(&out_extensions, &ext_out) ||
++        !CBB_add_bytes(&ext_out, CBS_data(&ext_body), CBS_len(&ext_body))) {
++      return false;
++    }
++  }
++  if (!found_key_share || !found_supported_versions) {
++    return false;
++  }
++
++  Array<uint8_t> patched;
++  if (!CBBFinishArray(cbb.get(), &patched)) {
++    return false;
++  }
++
++  // Adopt the mirrored random and cipher suite so that the connection state
++  // matches the bytes we are about to send.
++  OPENSSL_memcpy(ssl->s3->server_random, CBS_data(&mirror_random), 32);
++  if (can_adopt) {
++    hs->new_cipher = adopted;
++    hs->new_session->cipher = adopted;
++  }
++  *out = std::move(patched);
++  return true;
++}
++
+ static enum ssl_hs_wait_t do_send_server_hello(SSL_HANDSHAKE *hs) {
+   SSL *const ssl = hs->ssl;
+ 
+@@ -1047,6 +1188,19 @@ static enum ssl_hs_wait_t do_send_server_hello(SSL_HANDSHAKE *hs) {
+                    ECH_CONFIRMATION_SIGNAL_LEN);
+   }
+ 
++  // REALITY: optionally substitute a ServerHello mirrored from the real target
++  // site. This rewrites the message bytes only; the handshake state machine has
++  // already reached |state13_send_server_hello| and is unaffected. If the hook
++  // is not installed, or the mirrored message cannot be used,
++  // |reality_apply_server_hello| leaves |server_hello| untouched.
++  if (ssl->ctx->reality_cb != nullptr) {
++    const uint8_t *mirror = nullptr;
++    size_t mirror_len = 0;
++    if (ssl->ctx->reality_cb(ssl, &mirror, &mirror_len) && mirror != nullptr) {
++      reality_apply_server_hello(hs, &server_hello, mirror, mirror_len);
++    }
++  }
++
+   if (!ssl->method->add_message(ssl, std::move(server_hello))) {
+     return ssl_hs_error;
+   }

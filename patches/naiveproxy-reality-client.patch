@@ -1,0 +1,587 @@
+diff --git a/src/net/BUILD.gn b/src/net/BUILD.gn
+index 9a3d318f09..a45b3316a3 100644
+--- a/src/net/BUILD.gn
++++ b/src/net/BUILD.gn
+@@ -1011,6 +1011,7 @@ component("net") {
+     "socket/socks_connect_job.h",
+     "socket/ssl_client_socket.cc",
+     "socket/ssl_client_socket.h",
++    "socket/reality_config.cc",
+     "socket/ssl_client_socket_impl.cc",
+     "socket/ssl_client_socket_impl.h",
+     "socket/ssl_connect_job.cc",
+diff --git a/src/net/socket/reality_config.cc b/src/net/socket/reality_config.cc
+new file mode 100644
+index 0000000000..cc54685a18
+--- /dev/null
++++ b/src/net/socket/reality_config.cc
+@@ -0,0 +1,28 @@
++// Copyright 2025. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "net/socket/reality_config.h"
++
++#include <utility>
++
++namespace net {
++namespace {
++
++// naive.exe writes this during startup, before the IO thread (and therefore any
++// SSLClientSocketImpl) exists, so there is no concurrent access to
++// synchronize. base::NoDestructor is not usable here: std::optional of a
++// trivially destructible type trips its static_assert.
++std::optional<RealityConfig> g_reality_config;
++
++}  // namespace
++
++void SetRealityConfig(std::optional<RealityConfig> config) {
++  g_reality_config = std::move(config);
++}
++
++const std::optional<RealityConfig>& GetRealityConfig() {
++  return g_reality_config;
++}
++
++}  // namespace net
+diff --git a/src/net/socket/reality_config.h b/src/net/socket/reality_config.h
+new file mode 100644
+index 0000000000..2657747801
+--- /dev/null
++++ b/src/net/socket/reality_config.h
+@@ -0,0 +1,36 @@
++// Copyright 2025. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef NET_SOCKET_REALITY_CONFIG_H_
++#define NET_SOCKET_REALITY_CONFIG_H_
++
++#include <cstdint>
++#include <optional>
++
++#include "net/base/net_export.h"
++
++namespace net {
++
++// REALITY (https://github.com/XTLS/REALITY) client configuration. naive.exe
++// runs a single proxy configuration, so this is installed once at startup
++// instead of being plumbed through SSLConfig/CertVerifier; every
++// SSLClientSocketImpl then applies it.
++struct NET_EXPORT RealityConfig {
++  // Server static X25519 public key (32 bytes).
++  uint8_t public_key[32];
++  // Short id (8 bytes, right-zero-padded).
++  uint8_t short_id[8];
++};
++
++// Installs or clears the process-wide REALITY configuration. A nullopt disables
++// REALITY. Must be called before the IO thread (and thus any
++// SSLClientSocketImpl) starts; it is not synchronized with readers.
++NET_EXPORT void SetRealityConfig(std::optional<RealityConfig> config);
++
++// Returns the active configuration, or nullopt when REALITY is disabled.
++NET_EXPORT const std::optional<RealityConfig>& GetRealityConfig();
++
++}  // namespace net
++
++#endif  // NET_SOCKET_REALITY_CONFIG_H_
+diff --git a/src/net/socket/ssl_client_socket_impl.cc b/src/net/socket/ssl_client_socket_impl.cc
+index f586acfe0f..3ceb2ea58a 100644
+--- a/src/net/socket/ssl_client_socket_impl.cc
++++ b/src/net/socket/ssl_client_socket_impl.cc
+@@ -11,6 +11,7 @@
+ #include <cstring>
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <string_view>
+ #include <utility>
+ 
+@@ -55,6 +56,7 @@
+ #include "net/log/net_log_event_type.h"
+ #include "net/log/net_log_values.h"
+ #include "net/net_buildflags.h"
++#include "net/socket/reality_config.h"
+ #include "net/ssl/cert_compression.h"
+ #include "net/ssl/openssl_ssl_util.h"
+ #include "net/ssl/ssl_cert_request_info.h"
+@@ -71,6 +73,7 @@
+ #include "third_party/boringssl/src/include/openssl/err.h"
+ #include "third_party/boringssl/src/include/openssl/evp.h"
+ #include "third_party/boringssl/src/include/openssl/mem.h"
++#include "third_party/boringssl/src/include/openssl/pool.h"
+ #include "third_party/boringssl/src/include/openssl/ssl.h"
+ 
+ namespace net {
+@@ -884,6 +887,17 @@ int SSLClientSocketImpl::Init() {
+         ssl_.get(), ssl_config_.server_padding_to_request.value());
+   }
+ 
++  // REALITY: applied after the protocol configuration above so that the
++  // restrictions imposed by SSL_set1_reality_config (TLS 1.3 only, X25519 key
++  // share, no session tickets) are not overwritten afterwards. This is a no-op
++  // when REALITY is not configured.
++  const std::optional<RealityConfig>& reality_config = GetRealityConfig();
++  if (reality_config.has_value() &&
++      !SSL_set1_reality_config(ssl_.get(), reality_config->public_key,
++                               reality_config->short_id)) {
++    return ERR_UNEXPECTED;
++  }
++
+   // The compliance policy must be the last thing configured in order to have
+   // defined behavior.
+   if (context_->config().tls13_cipher_prefer_aes_256 &&
+@@ -1095,6 +1109,27 @@ ssl_verify_result_t SSLClientSocketImpl::VerifyCert() {
+                                  NetLogX509CertificateList(server_cert_.get()));
+   });
+ 
++  // REALITY: authenticate the peer with the AuthKey derived while building the
++  // ClientHello, before any standard chain or CT verification runs. The REALITY
++  // server's leaf certificate is self-signed and its signature field carries
++  // HMAC-SHA512(AuthKey, leaf public key), so a match means the peer is the
++  // REALITY server and the chain must not be verified normally. Otherwise fall
++  // through to standard verification: the peer is a real site the connection
++  // was redirected to, which is what REALITY is designed to hide behind.
++  const std::optional<RealityConfig>& reality_config = GetRealityConfig();
++  if (reality_config.has_value()) {
++    CRYPTO_BUFFER* leaf = server_cert_->cert_buffer();
++    if (SSL_reality_verify_certificate(ssl_.get(), CRYPTO_BUFFER_data(leaf),
++                                       CRYPTO_BUFFER_len(leaf))) {
++      server_cert_verify_result_.Reset();
++      server_cert_verify_result_.cert_status = 0;
++      server_cert_verify_result_.verified_cert = server_cert_;
++      server_cert_verify_result_.is_issued_by_known_root = false;
++      cert_verification_result_ = OK;
++      return ssl_verify_ok;
++    }
++  }
++
+   auto server_trust_anchor_ids = GetServerTrustAnchorIDs();
+   if (!server_trust_anchor_ids.empty()) {
+     net_log_.AddEvent(
+diff --git a/src/net/tools/naive/naive_config.cc b/src/net/tools/naive/naive_config.cc
+index 8b7de509e1..6cc4b71368 100644
+--- a/src/net/tools/naive/naive_config.cc
++++ b/src/net/tools/naive/naive_config.cc
+@@ -23,6 +23,23 @@ ProxyServer MyProxyUriToProxyServer(std::string_view uri) {
+   }
+   return ProxyUriToProxyServer(uri, ProxyServer::SCHEME_INVALID);
+ }
++
++// Decodes |hex| into |out|, which has room for |max_size| bytes. The decoded
++// value must be at least |min_size| bytes and the remaining bytes of |out| stay
++// zero, which is how REALITY short ids are right-zero-padded.
++bool HexDecode(std::string_view hex, size_t min_size, size_t max_size,
++               uint8_t* out) {
++  if (hex.empty()) {
++    return min_size == 0;
++  }
++  std::vector<uint8_t> bytes;
++  if (!base::HexStringToBytes(hex, &bytes) || bytes.size() < min_size ||
++      bytes.size() > max_size) {
++    return false;
++  }
++  std::copy(bytes.begin(), bytes.end(), out);
++  return true;
++}
+ }  // namespace
+ 
+ NaiveListenConfig::NaiveListenConfig() = default;
+@@ -325,6 +342,52 @@ bool NaiveConfig::Parse(const base::DictValue& value) {
+     no_post_quantum = true;
+   }
+ 
++  // REALITY client mode: a "reality" object in config.json, or the equivalent
++  // --reality-public-key/--reality-short-id switches (exposed as flat keys by
++  // GetSwitchesAsValue), which take precedence over the object.
++  const base::DictValue* reality_dict = nullptr;
++  if (const base::Value* v = value.Find("reality")) {
++    reality_dict = v->GetIfDict();
++    if (reality_dict == nullptr) {
++      std::cerr << "Invalid reality" << std::endl;
++      return false;
++    }
++  }
++  const std::string* public_key_hex =
++      reality_dict ? reality_dict->FindString("public_key") : nullptr;
++  if (const std::string* str = value.FindString("reality-public-key")) {
++    public_key_hex = str;
++  }
++  const std::string* short_id_hex =
++      reality_dict ? reality_dict->FindString("short_id") : nullptr;
++  if (const std::string* str = value.FindString("reality-short-id")) {
++    short_id_hex = str;
++  }
++  if (public_key_hex == nullptr) {
++    // A "reality" object without a public key, or a short id on its own, would
++    // silently configure nothing.
++    if (reality_dict != nullptr || short_id_hex != nullptr) {
++      std::cerr << "Invalid reality: missing public_key" << std::endl;
++      return false;
++    }
++  } else {
++    RealityConfig parsed_reality = {};
++    if (!HexDecode(*public_key_hex, /*min_size=*/32, /*max_size=*/32,
++                   parsed_reality.public_key)) {
++      std::cerr << "Invalid reality public_key (expected 64 hex digits)"
++                << std::endl;
++      return false;
++    }
++    if (short_id_hex != nullptr &&
++        !HexDecode(*short_id_hex, /*min_size=*/0, /*max_size=*/8,
++                   parsed_reality.short_id)) {
++      std::cerr << "Invalid reality short_id (expected up to 16 hex digits)"
++                << std::endl;
++      return false;
++    }
++    reality = parsed_reality;
++  }
++
+   return true;
+ }
+ 
+diff --git a/src/net/tools/naive/naive_config.h b/src/net/tools/naive/naive_config.h
+index 4ab14a09e0..a08032f779 100644
+--- a/src/net/tools/naive/naive_config.h
++++ b/src/net/tools/naive/naive_config.h
+@@ -20,6 +20,7 @@
+ #include "net/base/ip_address.h"
+ #include "net/base/proxy_chain.h"
+ #include "net/http/http_request_headers.h"
++#include "net/socket/reality_config.h"
+ #include "net/tools/naive/naive_protocol.h"
+ #include "url/scheme_host_port.h"
+ 
+@@ -76,6 +77,10 @@ struct NaiveConfig {
+ 
+   std::optional<bool> no_post_quantum;
+ 
++  // REALITY client mode is disabled unless this is set (see
++  // net/socket/reality_config.h).
++  std::optional<RealityConfig> reality;
++
+   NaiveConfig();
+   NaiveConfig(const NaiveConfig&);
+   ~NaiveConfig();
+diff --git a/src/net/tools/naive/naive_proxy_bin.cc b/src/net/tools/naive/naive_proxy_bin.cc
+index a8daa5dd4a..641a70aaa5 100644
+--- a/src/net/tools/naive/naive_proxy_bin.cc
++++ b/src/net/tools/naive/naive_proxy_bin.cc
+@@ -61,6 +61,7 @@
+ #include "net/quic/quic_context.h"
+ #include "net/socket/client_socket_pool.h"
+ #include "net/socket/client_socket_pool_manager.h"
++#include "net/socket/reality_config.h"
+ #include "net/socket/ssl_client_socket.h"
+ #include "net/socket/tcp_server_socket.h"
+ #include "net/socket/udp_server_socket.h"
+@@ -466,6 +467,9 @@ int main(int argc, char* argv[]) {
+                  "--log-net-log=<path>       Save NetLog\n"
+                  "--ssl-key-log-file=<path>  Save SSL keys for Wireshark\n"
+                  "--no-post-quantum          No post-quantum key agreement\n"
++                 "--reality-public-key=<hex> REALITY server public key\n"
++                 "                           (64 hex digits)\n"
++                 "--reality-short-id=<hex>    REALITY short id (up to 16 hex)\n"
+               << std::endl;
+     exit(EXIT_SUCCESS);
+   }
+@@ -481,6 +485,13 @@ int main(int argc, char* argv[]) {
+   }
+   CHECK(logging::InitLogging(config.log));
+ 
++  // Install the REALITY client configuration, if any, before any socket (and
++  // therefore any SSLClientSocketImpl) exists. Unset means REALITY is disabled
++  // and the handshake behaves exactly like upstream.
++  if (config.reality.has_value()) {
++    net::SetRealityConfig(*config.reality);
++  }
++
+   if (!config.ssl_key_log_file.empty()) {
+     net::SSLClientSocket::SetSSLKeyLogger(
+         std::make_unique<net::SSLKeyLoggerImpl>(config.ssl_key_log_file));
+diff --git a/src/third_party/boringssl/src/include/openssl/ssl.h b/src/third_party/boringssl/src/include/openssl/ssl.h
+index 7c9929ae6e..a2ca6ed931 100644
+--- a/src/third_party/boringssl/src/include/openssl/ssl.h
++++ b/src/third_party/boringssl/src/include/openssl/ssl.h
+@@ -5423,6 +5423,24 @@ OPENSSL_EXPORT void SSL_CTX_set_dos_protection_cb(
+ // For now, this is incompatible with `SSL_VERIFY_NONE` mode, and is only
+ // respected on clients.
+ OPENSSL_EXPORT void SSL_CTX_set_reverify_on_resume(SSL_CTX *ctx, int enabled);
++// SSL_set1_reality_config configures |ssl| as a REALITY client. |public_key| is
++// the REALITY server's static X25519 public key and |short_id| is the short id
++// sent in the sealed ClientHello session id. It must be called before the
++// handshake; when it is not called, |ssl| is an ordinary BoringSSL client.
++OPENSSL_EXPORT int SSL_set1_reality_config(SSL *ssl,
++                                           const uint8_t public_key[32],
++                                           const uint8_t short_id[8]);
++
++// SSL_reality_verify_certificate checks a REALITY server certificate. It
++// returns one when the leaf certificate's signature field equals
++// HMAC-SHA512(AuthKey, leaf_ed25519_public_key), which proves the peer derived
++// the same authentication key from the ClientHello session id. |leaf_der| is
++// the DER-encoded leaf certificate. It returns zero when REALITY is not
++// configured on |ssl| or the check fails.
++OPENSSL_EXPORT int SSL_reality_verify_certificate(SSL *ssl,
++                                                  const uint8_t *leaf_der,
++                                                  size_t leaf_der_len);
++
+ 
+ // SSL_ST_* are possible values for `SSL_state`, the bitmasks that make them up,
+ // and some historical values for compatibility. Only `SSL_ST_INIT` and
+diff --git a/src/third_party/boringssl/src/ssl/extensions.cc b/src/third_party/boringssl/src/ssl/extensions.cc
+index 954af185b8..a740dcad92 100644
+--- a/src/third_party/boringssl/src/ssl/extensions.cc
++++ b/src/third_party/boringssl/src/ssl/extensions.cc
+@@ -352,7 +352,14 @@ bool tls12_check_peer_sigalg(const SSL_HANDSHAKE *hs, uint8_t *out_alert,
+   // The peer must have selected an algorithm that is consistent with its public
+   // key, the TLS version, and what we advertised.
+   Span<const uint16_t> sigalgs = tls12_get_verify_sigalgs(hs);
+-  if (std::find(sigalgs.begin(), sigalgs.end(), sigalg) == sigalgs.end() ||
++  // REALITY: the server signs CertificateVerify with an Ed25519 certificate
++  // that Chrome-family clients do not advertise. Allow this one signature
++  // scheme only when REALITY is configured on the connection, and leave the
++  // advertised list untouched.
++  const bool is_reality_ed25519 =
++      hs->ssl->reality_configured && sigalg == SSL_SIGN_ED25519;
++  if ((std::find(sigalgs.begin(), sigalgs.end(), sigalg) == sigalgs.end() &&
++       !is_reality_ed25519) ||
+       !ssl_pkey_supports_algorithm(hs->ssl, pkey, sigalg, /*is_verify=*/true)) {
+     OPENSSL_PUT_ERROR(SSL, SSL_R_WRONG_SIGNATURE_TYPE);
+     *out_alert = SSL_AD_ILLEGAL_PARAMETER;
+diff --git a/src/third_party/boringssl/src/ssl/handshake_client.cc b/src/third_party/boringssl/src/ssl/handshake_client.cc
+index 62d5a0b245..688520f112 100644
+--- a/src/third_party/boringssl/src/ssl/handshake_client.cc
++++ b/src/third_party/boringssl/src/ssl/handshake_client.cc
+@@ -19,6 +19,7 @@
+ #include <assert.h>
+ #include <limits.h>
+ #include <string.h>
++#include <time.h>
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -26,6 +27,9 @@
+ #include <openssl/aead.h>
+ #include <openssl/bn.h>
+ #include <openssl/bytestring.h>
++#include <openssl/curve25519.h>
++#include <openssl/digest.h>
++#include <openssl/hkdf.h>
+ #include <openssl/ec_key.h>
+ #include <openssl/ecdsa.h>
+ #include <openssl/err.h>
+@@ -181,6 +185,109 @@ bool ssl_write_client_hello_without_extensions(const SSL_HANDSHAKE *hs,
+   return true;
+ }
+ 
++// REALITY: derives the authentication key
++//   HKDF-SHA256(X25519(client ephemeral private key, server static public key),
++//               salt = client_random[0:20], info = "REALITY")
++// from the X25519 key share this client offers. Returns true on success.
++static bool reality_derive_auth_key(SSL_HANDSHAKE *hs, uint8_t out_key[32]) {
++  SSL *const ssl = hs->ssl;
++  uint8_t private_key[32];
++  bool found = false;
++  for (const auto &key_share : hs->key_shares) {
++    if (key_share->GroupID() != SSL_GROUP_X25519) {
++      continue;
++    }
++    ScopedCBB cbb;
++    uint8_t *data = nullptr;
++    size_t len = 0;
++    if (!CBB_init(cbb.get(), 32) || !key_share->SerializePrivateKey(cbb.get()) ||
++        !CBB_finish(cbb.get(), &data, &len)) {
++      return false;
++    }
++    if (len != sizeof(private_key)) {
++      OPENSSL_free(data);
++      return false;
++    }
++    OPENSSL_memcpy(private_key, data, sizeof(private_key));
++    OPENSSL_free(data);
++    found = true;
++    break;
++  }
++  if (!found || ssl->s3 == nullptr) {
++    return false;
++  }
++  uint8_t shared_key[32];
++  static const uint8_t kInfo[] = "REALITY";
++  if (!X25519(shared_key, private_key, ssl->reality_public_key) ||
++      !HKDF(out_key, 32, EVP_sha256(), shared_key, sizeof(shared_key),
++            ssl->s3->client_random, 20, kInfo, sizeof(kInfo) - 1)) {
++    return false;
++  }
++  return true;
++}
++
++// REALITY: seals the client version, a timestamp and the short id into the
++// ClientHello's legacy session id. Called after the ClientHello has been built
++// and before it is hashed and sent, so the transcript and the wire bytes agree.
++static bool reality_patch_client_hello(SSL_HANDSHAKE *hs, Array<uint8_t> *msg) {
++  SSL *const ssl = hs->ssl;
++  if (!ssl->reality_configured) {
++    return true;
++  }
++  // The legacy session id contents are at offset 39: 4-byte handshake header,
++  // 2-byte legacy_version, 32-byte random, then the one-byte session-id length.
++  static const size_t kSessionIdOffset = 39;
++  static const size_t kSessionIdLength = 32;
++  static const uint8_t kClientVersion[3] = {1, 0, 0};
++  if (msg->size() < kSessionIdOffset + kSessionIdLength ||
++      hs->session_id.size() != kSessionIdLength || ssl->s3 == nullptr) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
++  uint8_t auth_key[32];
++  if (!reality_derive_auth_key(hs, auth_key)) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
++  // The sealed blob is 16 bytes of payload (version, timestamp, short id) plus
++  // the 16-byte AEAD tag, filling the 32-byte session id exactly.
++  uint8_t plaintext[16] = {0};
++  plaintext[0] = kClientVersion[0];
++  plaintext[1] = kClientVersion[1];
++  plaintext[2] = kClientVersion[2];
++  plaintext[3] = 0;  // reserved
++  const uint32_t timestamp = static_cast<uint32_t>(time(nullptr));
++  plaintext[4] = static_cast<uint8_t>(timestamp >> 24);
++  plaintext[5] = static_cast<uint8_t>(timestamp >> 16);
++  plaintext[6] = static_cast<uint8_t>(timestamp >> 8);
++  plaintext[7] = static_cast<uint8_t>(timestamp);
++  OPENSSL_memcpy(plaintext + 8, ssl->reality_short_id, 8);
++
++  // The AEAD additional data is the ClientHello with a zeroed session id,
++  // matching what the server reconstructs.
++  OPENSSL_memset(msg->data() + kSessionIdOffset, 0, kSessionIdLength);
++  EVP_AEAD_CTX aead_ctx;
++  if (!EVP_AEAD_CTX_init(&aead_ctx, EVP_aead_aes_256_gcm(), auth_key,
++                         sizeof(auth_key), 0, nullptr)) {
++    return false;
++  }
++  uint8_t sealed[32];
++  size_t sealed_len = 0;
++  const bool ok = EVP_AEAD_CTX_seal(
++      &aead_ctx, sealed, &sealed_len, sizeof(sealed), ssl->s3->client_random + 20,
++      12, plaintext, sizeof(plaintext), msg->data(), msg->size());
++  EVP_AEAD_CTX_cleanup(&aead_ctx);
++  if (!ok || sealed_len != sizeof(sealed)) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
++  OPENSSL_memcpy(msg->data() + kSessionIdOffset, sealed, sizeof(sealed));
++  OPENSSL_memcpy(hs->session_id.data(), sealed, sizeof(sealed));
++  OPENSSL_memcpy(ssl->reality_auth_key, auth_key, sizeof(auth_key));
++  ssl->reality_auth_key_set = true;
++  return true;
++}
++
+ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+   SSLImpl *const ssl = hs->ssl;
+   ScopedCBB cbb;
+@@ -197,6 +304,12 @@ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+     return false;
+   }
+ 
++  // REALITY: seal the authentication blob into the session id before
++  // the ClientHello is hashed and sent.
++  if (!reality_patch_client_hello(hs, &msg)) {
++    return false;
++  }
++
+   return ssl->method->add_message(ssl, std::move(msg));
+ }
+ 
+diff --git a/src/third_party/boringssl/src/ssl/internal.h b/src/third_party/boringssl/src/ssl/internal.h
+index 60ee51b004..b3a79c00b5 100644
+--- a/src/third_party/boringssl/src/ssl/internal.h
++++ b/src/third_party/boringssl/src/ssl/internal.h
+@@ -4369,6 +4369,16 @@ class SSLImpl : public ssl_st {
+   // server is true iff this SSL* is the server half. Note: before the SSL*
+   // is initialized by either SSL_set_accept_state or SSL_set_connect_state,
+   // the side is not determined. In this state, server is always false.
++  // REALITY client state. |reality_configured| is set by
++  // |SSL_set1_reality_config| before the handshake. |reality_auth_key| is
++  // derived while the ClientHello is built and consulted when the peer
++  // certificate is verified.
++  bool reality_configured = false;
++  uint8_t reality_public_key[32] = {0};
++  uint8_t reality_short_id[8] = {0};
++  bool reality_auth_key_set = false;
++  uint8_t reality_auth_key[32] = {0};
++
+   bool server : 1;
+ 
+   // quiet_shutdown is true if the connection should not send a close_notify on
+diff --git a/src/third_party/boringssl/src/ssl/ssl_lib.cc b/src/third_party/boringssl/src/ssl/ssl_lib.cc
+index b7d99807fd..48fb59558e 100644
+--- a/src/third_party/boringssl/src/ssl/ssl_lib.cc
++++ b/src/third_party/boringssl/src/ssl/ssl_lib.cc
+@@ -29,6 +29,8 @@
+ #include <openssl/crypto.h>
+ #include <openssl/err.h>
+ #include <openssl/evp.h>
++#include <openssl/hmac.h>
++#include <openssl/x509.h>
+ #include <openssl/mem.h>
+ #include <openssl/nid.h>
+ #include <openssl/rand.h>
+@@ -3012,6 +3014,56 @@ void SSL_CTX_set_select_certificate_cb(
+   FromOpaque(ctx)->select_certificate_cb = cb;
+ }
+ 
++
++int SSL_set1_reality_config(SSL *ssl, const uint8_t public_key[32],
++                            const uint8_t short_id[8]) {
++  if (ssl == nullptr || public_key == nullptr || short_id == nullptr) {
++    return 0;
++  }
++  OPENSSL_memcpy(FromOpaque(ssl)->reality_public_key, public_key, 32);
++  OPENSSL_memcpy(FromOpaque(ssl)->reality_short_id, short_id, 8);
++  FromOpaque(ssl)->reality_configured = true;
++  return 1;
++}
++
++int SSL_reality_verify_certificate(SSL *ssl, const uint8_t *leaf_der,
++                                   size_t leaf_der_len) {
++  if (ssl == nullptr || !FromOpaque(ssl)->reality_configured ||
++      !FromOpaque(ssl)->reality_auth_key_set || leaf_der == nullptr) {
++    return 0;
++  }
++  const uint8_t *p = leaf_der;
++  bssl::UniquePtr<X509> leaf(d2i_X509(nullptr, &p, leaf_der_len));
++  if (leaf == nullptr) {
++    return 0;
++  }
++  EVP_PKEY *pubkey = X509_get0_pubkey(leaf.get());
++  if (pubkey == nullptr || EVP_PKEY_id(pubkey) != EVP_PKEY_ED25519) {
++    return 0;
++  }
++  uint8_t raw_public_key[32];
++  size_t raw_public_key_len = sizeof(raw_public_key);
++  if (!EVP_PKEY_get_raw_public_key(pubkey, raw_public_key,
++                                   &raw_public_key_len) ||
++      raw_public_key_len != sizeof(raw_public_key)) {
++    return 0;
++  }
++  const ASN1_BIT_STRING *signature = nullptr;
++  X509_get0_signature(&signature, nullptr, leaf.get());
++  if (signature == nullptr || ASN1_STRING_length(signature) != 64) {
++    return 0;
++  }
++  uint8_t expected[64];
++  unsigned int expected_len = 0;
++  if (HMAC(EVP_sha512(), FromOpaque(ssl)->reality_auth_key, 32, raw_public_key,
++           sizeof(raw_public_key), expected,
++           &expected_len) == nullptr ||
++      expected_len != sizeof(expected)) {
++    return 0;
++  }
++  return CRYPTO_memcmp(expected, ASN1_STRING_get0_data(signature), 64) == 0;
++}
++
+ void SSL_CTX_set_dos_protection_cb(SSL_CTX *ctx,
+                                    int (*cb)(const SSL_CLIENT_HELLO *)) {
+   FromOpaque(ctx)->dos_protection_cb = cb;
