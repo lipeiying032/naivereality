@@ -41,7 +41,7 @@ jobs:
       - name: Build the server-side programs (server patch only)
         run: |
           ONLY_SERVER=1 BSSL_DIR="$GITHUB_WORKSPACE/boringssl" bash server/build.sh "$GITHUB_WORKSPACE/bin"
-          ./bin/poc_suspend | tee poc_suspend.log
+          ./bin/poc_suspend 2>&1 | tee poc_suspend.log
 
       - name: Apply the client-side code to the same BoringSSL tree
         run: |
@@ -56,7 +56,33 @@ jobs:
         run: |
           set -o pipefail
           BSSL_DIR="$GITHUB_WORKSPACE/boringssl" bash server/build.sh "$GITHUB_WORKSPACE/bin"
-          ./bin/poc_end_to_end | tee poc_end_to_end.log
+          ./bin/poc_end_to_end 2>&1 | tee poc_end_to_end.log
+
+      - name: Smoke-test the front end over real TCP (REALITY + fallback)
+        run: |
+          set -o pipefail
+          ./bin/genkey > /tmp/keys.txt
+          PRIV=$(sed -n 1p /tmp/keys.txt)
+          PUB=$(sed -n 2p /tmp/keys.txt)
+          SHORT=0102030405060708
+          ./bin/poc_mirror_server 18443 > mirror.log 2>&1 &
+          sleep 1
+          ./bin/reality_server --listen 127.0.0.1:18444 --target 127.0.0.1:18443 \
+            --private-key "$PRIV" --short-id "$SHORT" > frontend.log 2>&1 &
+          sleep 1
+          echo "--- authenticated REALITY client ---"
+          ./bin/poc_client 18444 "$PUB" "$SHORT" "ci-smoke" 2>&1 | tee client.log
+          grep -q "handshake ok" client.log
+          grep -q "ci-smoke" client.log
+          echo "--- unauthenticated probe (transparent fallback) ---"
+          printf 'probe-through-fallback\n' | timeout 15 openssl s_client \
+            -connect 127.0.0.1:18444 -tls1_3 -quiet -servername probe.test > probe.log 2>&1 || true
+          grep -q "CN = mirror" probe.log
+          grep -q "probe-through-fallback" probe.log
+          echo "--- front end log ---"
+          cat frontend.log
+          grep -q "mirrored ServerHello: yes, 122 bytes" frontend.log
+          echo "OK: REALITY handshake + mirror injection + transparent fallback"
 
       - uses: actions/upload-artifact@v4
         if: always()
