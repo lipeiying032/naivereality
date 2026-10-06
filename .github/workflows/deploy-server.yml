@@ -1,0 +1,164 @@
+name: deploy-server
+
+# Builds the *server-only* REALITY front end (BoringSSL + the server patch, no
+# client seams) and a full-patch validation job, so the binary that gets
+# deployed is the clean server-only one. Triggered by pushes to this branch or
+# manually via workflow_dispatch.
+on:
+  workflow_dispatch:
+  push:
+    branches: [deploy-server]
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Deployment artifact: BoringSSL with only the SERVER patch applied.
+  # ---------------------------------------------------------------------------
+  server-only:
+    name: server-only binaries (deployment artifact)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone BoringSSL at the pinned tag (0.20260413.0)
+        run: |
+          git clone --depth 1 https://boringssl.googlesource.com/boringssl
+          cd boringssl
+          git fetch --depth 1 origin 78f7fbeec98a2fb15acea6f7a9f1def7f2e6d9a0
+          git checkout FETCH_HEAD
+          git log --oneline -1
+
+      - name: Apply the REALITY server patch
+        run: |
+          git -C boringssl apply "$GITHUB_WORKSPACE/patches/boringssl-reality-server.patch"
+          git -C boringssl diff --stat
+
+      - name: Build libssl / libcrypto
+        run: |
+          cd boringssl
+          cmake -GNinja -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF .
+          ninja -C build -j"$(nproc)" ssl crypto
+
+      - name: Build the server-side programs (server patch only)
+        run: |
+          set -o pipefail
+          ONLY_SERVER=1 BSSL_DIR="$GITHUB_WORKSPACE/boringssl" \
+            bash server/build.sh "$GITHUB_WORKSPACE/bin-server-only"
+          ./bin-server-only/poc_suspend 2>&1 | tee poc_suspend.log
+          sha256sum bin-server-only/reality_server bin-server-only/poc_mirror_server \
+            bin-server-only/poc_suspend | tee sha256sums.txt
+          ldd bin-server-only/reality_server | tee ldd.txt
+
+      - name: Smoke test the server-only binary over real TCP (fallback path)
+        run: |
+          set -o pipefail
+          openssl genpkey -algorithm X25519 -out /tmp/k.pem
+          PRIV=$(openssl pkey -in /tmp/k.pem -outform DER | tail -c 32 | xxd -p -c 32)
+          SHORT=0102030405060708
+          ./bin-server-only/poc_mirror_server 18443 > mirror.log 2>&1 &
+          sleep 1
+          ./bin-server-only/reality_server --listen 127.0.0.1:18444 --target 127.0.0.1:18443 \
+            --private-key "$PRIV" --short-id "$SHORT" > frontend.log 2>&1 &
+          sleep 1
+          printf 'probe-through-fallback\n' | timeout 15 openssl s_client \
+            -connect 127.0.0.1:18444 -tls1_3 -quiet -servername probe.test > probe.log 2>&1 || true
+          grep -q "CN = mirror" probe.log
+          grep -q "probe-through-fallback" probe.log
+          cat frontend.log
+          echo "OK: server-only binary transparently forwards an unauthenticated probe"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nr-reality-server-only-linux-x86_64
+          path: |
+            bin-server-only/reality_server
+            bin-server-only/poc_mirror_server
+            bin-server-only/poc_suspend
+            poc_suspend.log
+            sha256sums.txt
+            ldd.txt
+            frontend.log
+            probe.log
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Validation artifact: the upstream full-patch flow (server + client seams,
+  # in-process PoCs and the REALITY-client TCP smoke test).
+  # ---------------------------------------------------------------------------
+  validate-full:
+    name: full-patch validation (PoCs + REALITY smoke test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone BoringSSL at the pinned tag (0.20260413.0)
+        run: |
+          git clone --depth 1 https://boringssl.googlesource.com/boringssl
+          cd boringssl
+          git fetch --depth 1 origin 78f7fbeec98a2fb15acea6f7a9f1def7f2e6d9a0
+          git checkout FETCH_HEAD
+          git log --oneline -1
+
+      - name: Apply the REALITY server patch
+        run: |
+          git -C boringssl apply "$GITHUB_WORKSPACE/patches/boringssl-reality-server.patch"
+          git -C boringssl diff --stat
+
+      - name: Build libssl / libcrypto
+        run: |
+          cd boringssl
+          cmake -GNinja -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF .
+          ninja -C build -j"$(nproc)" ssl crypto
+
+      - name: Apply the client-side code to the same BoringSSL tree
+        run: |
+          python3 tools/apply_client_code.py "$GITHUB_WORKSPACE/boringssl"
+          ninja -C boringssl/build -j"$(nproc)" ssl
+
+      - name: Build all programs (incl. the REALITY client) and run PoC 2
+        run: |
+          set -o pipefail
+          BSSL_DIR="$GITHUB_WORKSPACE/boringssl" bash server/build.sh "$GITHUB_WORKSPACE/bin"
+          ./bin/poc_suspend 2>&1 | tee poc_suspend.log
+          ./bin/poc_end_to_end 2>&1 | tee poc_end_to_end.log
+
+      - name: Smoke-test the front end over real TCP (REALITY + fallback)
+        run: |
+          set -o pipefail
+          ./bin/genkey > /tmp/keys.txt
+          PRIV=$(sed -n 1p /tmp/keys.txt)
+          PUB=$(sed -n 2p /tmp/keys.txt)
+          SHORT=0102030405060708
+          ./bin/poc_mirror_server 18443 > mirror.log 2>&1 &
+          sleep 1
+          ./bin/reality_server --listen 127.0.0.1:18444 --target 127.0.0.1:18443 \
+            --private-key "$PRIV" --short-id "$SHORT" > frontend.log 2>&1 &
+          sleep 1
+          echo "--- authenticated REALITY client ---"
+          ./bin/poc_client 18444 "$PUB" "$SHORT" "ci-smoke" 2>&1 | tee client.log
+          grep -q "handshake ok" client.log
+          grep -q "ci-smoke" client.log
+          echo "--- unauthenticated probe (transparent fallback) ---"
+          printf 'probe-through-fallback\n' | timeout 15 openssl s_client \
+            -connect 127.0.0.1:18444 -tls1_3 -quiet -servername probe.test > probe.log 2>&1 || true
+          grep -q "CN = mirror" probe.log
+          grep -q "probe-through-fallback" probe.log
+          cat frontend.log
+          grep -q "mirrored ServerHello: yes, 122 bytes" frontend.log
+          echo "OK: REALITY handshake + mirror injection + transparent fallback"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nr-reality-validate-full-logs
+          path: |
+            poc_suspend.log
+            poc_end_to_end.log
+            client.log
+            probe.log
+            frontend.log
+            mirror.log
+          if-no-files-found: warn
