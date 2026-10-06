@@ -181,6 +181,18 @@ bool DialMirrorAndCapture(const ServerOptions &options, uint16_t group,
   // No tickets => no pre_shared_key offer => the mirrored ServerHello cannot
   // select a PSK we did not negotiate.
   SSL_CTX_set_options(ctx.get(), SSL_OP_NO_TICKET);
+  // Offer the same ALPN the client-facing handshake selects. The mirrored
+  // ServerHello replaces ours byte for byte (see reality_apply_server_hello),
+  // so whatever the real target answers here is exactly what the client sees.
+  // Without this the borrowed site returns no ALPN extension, the client
+  // negotiates none, and an h2-only backend (naive's HTTP/2 CONNECT) becomes
+  // unreachable. Targets that do not speak h2 simply answer without ALPN, in
+  // which case nothing changes.
+  static const uint8_t kMirrorAlpn[] = {2, 'h', '2'};
+  if (SSL_CTX_set_alpn_protos(ctx.get(), kMirrorAlpn, sizeof(kMirrorAlpn)) !=
+      0) {
+    fprintf(stderr, "reality: mirror ALPN list rejected\n");
+  }
   if (!SSL_set_tlsext_host_name(ssl.get(), options.target_host.c_str())) {
     close(fd);
     return false;
