@@ -359,6 +359,44 @@ bool L4Authenticate(int fd, const ServerOptions &options,
   return true;
 }
 
+// ALPN selection. The REALITY endpoint terminates TLS for whatever sits behind
+// it (e.g. a naive / HTTP/2 CONNECT backend), so it advertises the protocol a
+// real h2 site would: a naive client only switches to HTTP/2 CONNECT when ALPN
+// negotiates "h2". Clients that do not offer h2 keep their own protocol -- the
+// callback returns NOACK and the handshake continues without ALPN, exactly like
+// a site that does not speak h2. This is a deployment addition on top of the
+// repository's front end (which documented the backend as "a naive/h2 endpoint"
+// but never selected ALPN).
+static int SelectAlpnCallback(SSL *ssl, const uint8_t **out, uint8_t *out_len,
+                              const uint8_t *in, unsigned in_len, void *arg) {
+  const uint8_t *h2 = nullptr;
+  const uint8_t *http11 = nullptr;
+  for (unsigned i = 0; i + 1 <= in_len;) {
+    const unsigned len = in[i];
+    if (len == 0 || i + 1 + len > in_len) {
+      break;
+    }
+    const uint8_t *proto = in + i + 1;
+    if (len == 2 && proto[0] == 'h' && proto[1] == '2') {
+      h2 = proto;
+    } else if (len == 8 && memcmp(proto, "http/1.1", 8) == 0) {
+      http11 = proto;
+    }
+    i += 1 + len;
+  }
+  if (h2 != nullptr) {
+    *out = h2;
+    *out_len = 2;
+    return SSL_TLSEXT_ERR_OK;
+  }
+  if (http11 != nullptr) {
+    *out = http11;
+    *out_len = 8;
+    return SSL_TLSEXT_ERR_OK;
+  }
+  return SSL_TLSEXT_ERR_NOACK;
+}
+
 void RunRealityConnection(int fd, const ServerOptions &options,
                           RealityAuthResult auth) {
   bssl::UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_server_method()));
@@ -369,6 +407,7 @@ void RunRealityConnection(int fd, const ServerOptions &options,
   SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION);
   SSL_CTX_set_max_proto_version(ctx.get(), TLS1_3_VERSION);
   SSL_CTX_set_select_certificate_cb(ctx.get(), SelectCertificateCallback);
+  SSL_CTX_set_alpn_select_cb(ctx.get(), SelectAlpnCallback, nullptr);
   SSL_CTX_set_reality_serverhello_cb(ctx.get(), ServerHelloMirrorCallback);
   bssl::UniquePtr<SSL> ssl(SSL_new(ctx.get()));
   if (ssl == nullptr) {
